@@ -9,6 +9,7 @@
 package ginhttp
 
 import (
+	"bytes"
 	"net/http"
 	"net/url"
 
@@ -18,6 +19,24 @@ import (
 )
 
 const defaultComponentName = "net/http"
+
+type LoggingWriter struct {
+	gin.ResponseWriter
+	Buffer *bytes.Buffer
+}
+
+func NewLoggingWriter(responseWriter gin.ResponseWriter) *LoggingWriter {
+	return &LoggingWriter{
+		ResponseWriter: responseWriter,
+		Buffer:         new(bytes.Buffer),
+	}
+}
+
+func (l LoggingWriter) Write(data []byte) (int, error) {
+	l.Buffer.Write(data)
+	n, err := l.ResponseWriter.Write(data)
+	return n, err
+}
 
 type mwOptions struct {
 	opNameFunc    func(r *http.Request) string
@@ -67,7 +86,7 @@ func MWURLTagFunc(f func(u *url.URL) string) MWOption {
 func Middleware(tr opentracing.Tracer, options ...MWOption) gin.HandlerFunc {
 	opts := mwOptions{
 		opNameFunc: func(r *http.Request) string {
-			return "HTTP " + r.Method
+			return "HTTP router " + r.Method + " - " + r.RequestURI
 		},
 		spanObserver: func(span opentracing.Span, r *http.Request) {},
 		urlTagFunc: func(u *url.URL) string {
@@ -86,6 +105,8 @@ func Middleware(tr opentracing.Tracer, options ...MWOption) gin.HandlerFunc {
 		ext.HTTPMethod.Set(sp, c.Request.Method)
 		ext.HTTPUrl.Set(sp, opts.urlTagFunc(c.Request.URL))
 		opts.spanObserver(sp, c.Request)
+		writer := NewLoggingWriter(c.Writer)
+		c.Writer = writer
 
 		// set component name, use "net/http" if caller does not specify
 		componentName := opts.componentName
@@ -98,7 +119,17 @@ func Middleware(tr opentracing.Tracer, options ...MWOption) gin.HandlerFunc {
 
 		c.Next()
 
-		ext.HTTPStatusCode.Set(sp, uint16(c.Writer.Status()))
+		// Perform appropriate logging for errors
+		statusCode := c.Writer.Status()
+
+		if statusCode != 200 && statusCode != 204 && statusCode != 302 && statusCode != 301 {
+			sp.SetTag("error", true)
+			sp.SetTag("event", "error")
+			sp.SetTag("message", string(writer.Buffer.Bytes()))
+		}
+
+		ext.HTTPStatusCode.Set(sp, uint16(statusCode))
+
 		sp.Finish()
 	}
 }
